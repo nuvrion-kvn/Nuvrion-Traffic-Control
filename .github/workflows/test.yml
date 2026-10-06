@@ -28,16 +28,24 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-      - name: Публикация проверенного первого выпуска
+      - name: Публикация проверенной версии
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           set -euo pipefail
           version=$(tr -d '\r\n' < VERSION)
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           sha256sum -c SHA256SUMS
-          if gh release view "v$version" >/dev/null 2>&1; then exit 0; fi
+          if gh release view "v$version" >/dev/null 2>&1; then
+            if [[ "$COMMIT_MESSAGE" != *"[обновить-выпуск]"* ]]; then exit 0; fi
+            git tag -f "v$version" "$GITHUB_SHA"
+            git push --force origin "refs/tags/v$version"
+            gh release edit "v$version" --title "Nuvrion Traffic Control $version" --notes-file RELEASE_NOTES.md
+            gh release upload "v$version" --clobber nuvrion-traffic-control.py SHA256SUMS
+            exit 0
+          fi
           gh release create "v$version" --target "$GITHUB_SHA" \
             --title "Nuvrion Traffic Control $version" --notes-file RELEASE_NOTES.md \
             nuvrion-traffic-control.py SHA256SUMS

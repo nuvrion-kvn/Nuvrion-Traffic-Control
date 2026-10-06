@@ -8,8 +8,7 @@
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab" alt="Python 3.10 и новее">
 </p>
 <p align="center">Автор и разработчик: <b>Nuvrion</b><br>
-<a href="https://github.com/nuvrion-kvn">GitHub · nuvrion-kvn</a> ·
-<a href="mailto:himik0011113@gmail.com">Email · himik0011113@gmail.com</a></p>
+<a href="https://github.com/nuvrion-kvn">GitHub · nuvrion-kvn</a></p>
 
 **Nuvrion Traffic Control 1.0.0** управляет входящими соединениями Linux-сервера через собственную таблицу nftables. Загружает три списка IP/CIDR, проверяет их содержимое и объединяет с ручными блокировками. Исключения для администратора и панели имеют приоритет.
 
@@ -17,11 +16,9 @@
 
 ![Источники, исключения и фильтрация Nuvrion Traffic Control](assets/traffic-scheme.svg)
 
+[Открыть подробную схему в полном размере](assets/traffic-scheme.svg)
+
 **[Установка](#установка) · [Команды](#команды) · [Обновление](docs/UPDATE.md) · [Диагностика](#диагностика-и-журналы) · [Поддержка](SUPPORT.md)**
-
-## Первый выпуск Nuvrion
-
-Версия проекта и поставляемых скриптов — **1.0.0**. Новые имена файлов, переменных окружения и служб приведены в инструкциях ниже. Установка под новым именем не переносит настройки ранее установленного проекта автоматически. Для существующего сервера сначала проверьте службы, пути и правила firewall; новые команды рассчитаны на установку Nuvrion.
 
 ## Возможности
 
@@ -203,7 +200,7 @@ sudo ntc uninstall --yes
 
 ## Документация проекта
 
-- [Первый релиз 1.0.0](RELEASE_NOTES.md)
+- [Описание версии 1.0.0](RELEASE_NOTES.md)
 - [Обновление установленной версии](docs/UPDATE.md)
 - [Поддержка и сообщения об ошибках](SUPPORT.md)
 - [Сообщения об уязвимостях](SECURITY.md)
@@ -224,7 +221,7 @@ sha256sum -c SHA256SUMS
 ## Автор и лицензия
 
 **Nuvrion** — автор и разработчик Nuvrion.
-[GitHub: nuvrion-kvn](https://github.com/nuvrion-kvn) · [Email: himik0011113@gmail.com](mailto:himik0011113@gmail.com).
+[GitHub: nuvrion-kvn](https://github.com/nuvrion-kvn).
 
 Оригинальный код — [MIT](LICENSE). Внешние списки и системные компоненты сохраняют собственные лицензии
 и авторство. Исполняемый код TrafficGuard не включается и не запускается.

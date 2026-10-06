@@ -1,7 +1,6 @@
 # Поддержка
 
-Автор: **Nuvrion** · [GitHub](https://github.com/nuvrion-kvn) ·
-[Email: himik0011113@gmail.com](mailto:himik0011113@gmail.com).
+Автор: **Nuvrion** · [GitHub](https://github.com/nuvrion-kvn).
 
 Для ошибки создайте [Issue](https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/issues/new/choose).
 Укажите ОС, Python, результат `ntc --version`, действие и ожидаемый результат. Добавьте относящиеся
