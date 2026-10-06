@@ -1,0 +1,669 @@
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+import io
+from argparse import Namespace
+from types import SimpleNamespace
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location("control", Path(__file__).parents[1] / "nuvrion-traffic-control.py")
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+
+
+class ControlTests(unittest.TestCase):
+    def test_visible_padding_ignores_ansi(self):
+        value = '\033[92mТест\033[0m'
+        self.assertEqual(c.vislen(value), 4)
+        self.assertEqual(c.vislen(c.pad_left(value, 10)), 10)
+        self.assertEqual(c.vislen(c.pad_right(value, 10)), 10)
+        self.assertEqual(c.vislen(c.clip(value, 3)), 3)
+
+    def test_header_borders_align_with_and_without_color(self):
+        class Terminal(io.StringIO):
+            encoding = 'utf-8'
+            def isatty(self):
+                return True
+        for width in (20, 40, 53, 78, 120):
+            for no_color in (True, False):
+                output = Terminal()
+                with patch('sys.stdout', output), \
+                     patch.dict(c.os.environ, {'NO_COLOR': '1'} if no_color else {}, clear=True), \
+                     patch.object(c.shutil, 'get_terminal_size', return_value=c.os.terminal_size((width, 24))):
+                    c.brand_header()
+                    self.assertTrue(all(c.vislen(line) == min(width, 78)
+                                        for line in output.getvalue().splitlines() if line))
+                if no_color:
+                    self.assertNotIn('\033', output.getvalue())
+                    self.assertNotIn('│', output.getvalue())
+                else:
+                    self.assertIn('╭', output.getvalue())
+
+    def test_badges_have_equal_width(self):
+        sizes = [c.vislen(c.badge(label, 'yellow')) for label in
+                 ('АКТИВЕН', 'НЕ УСТАНОВЛЕН', 'ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ', 'ТРЕБУЕТ ВОССТАНОВЛЕНИЯ')]
+        self.assertEqual(len(set(sizes)), 1)
+
+    def test_low_menu_limits_top_and_never_clears_no_color(self):
+        output = io.StringIO()
+        with patch('sys.stdout', output), patch.dict(c.os.environ, {'NO_COLOR': '1'}), \
+             patch.object(c, 'STATE') as state, patch.object(c, 'menu_status', return_value='АКТИВЕН'), \
+             patch.object(c, 'load', return_value=self.state()), patch.object(c, 'component_report'), \
+             patch.object(c, 'top') as top, patch('builtins.input', return_value='0'), \
+             patch.object(c.shutil, 'get_terminal_size', return_value=c.os.terminal_size((53, 24))):
+            state.exists.return_value = True
+            c.menu()
+        top.assert_called_once_with(limit=5)
+        self.assertNotIn('\033', output.getvalue())
+
+    def state(self):
+        return dict(ssh_ports=[22222], allow=["198.51.100.9", "2001:db8::1"],
+                    lists={"test": ["198.51.100.0/24", "2001:db8::/32"]}, manual=[],
+                    updated=1700000000, logging=True)
+
+    def test_canonical(self):
+        self.assertEqual(c.networks("1.2.3.4/24 # test\n"), ["1.2.3.0/24"])
+
+    def test_collapse(self):
+        self.assertEqual(c.networks("1.2.3.0/25\n1.2.3.128/25\n1.2.3.0/25"), ["1.2.3.0/24"])
+
+    def test_empty(self):
+        with self.assertRaises(ValueError):
+            c.networks("# empty\n")
+
+    def test_invalid(self):
+        for value in ("<html>", "1.2.3.4; flush ruleset", "0.0.0.0/0", "::/0", "999.1.1.1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                c.networks(value)
+
+    def test_indirect_default_routes_are_rejected_after_collapse(self):
+        for value in ("0.0.0.0/1\n128.0.0.0/1", "::/1\n8000::/1"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "покрывает весь"):
+                c.networks(value)
+
+    def test_render_rejects_default_route_created_across_lists(self):
+        state = self.state()
+        state["lists"] = {"a": ["0.0.0.0/1"], "b": ["128.0.0.0/1"]}
+        with self.assertRaisesRegex(ValueError, "Совокупность блокировок"):
+            c.render(state)
+
+    def test_ipv6(self):
+        self.assertEqual(c.networks("2001:db8::1"), ["2001:db8::1/128"])
+
+    def test_priority(self):
+        rules = c.render(self.state())
+        self.assertLess(rules.index("tcp dport"), rules.index("counter drop"))
+        self.assertLess(rules.index("saddr @allow4"), rules.index("saddr @block4"))
+        self.assertIn("ip6 saddr @block6 counter drop", rules)
+
+    def test_scope(self):
+        rules = c.render(self.state(), True)
+        self.assertTrue(rules.startswith("delete table inet nuvrion_tc\n"))
+        for forbidden in ("flush ruleset", "hook output", "hook forward", "ufw", "SCANNERS"):
+            self.assertNotIn(forbidden, rules)
+
+    def test_bad_ports(self):
+        for ports in ([], [0], [65536]):
+            state = self.state()
+            state["ssh_ports"] = ports
+            with self.assertRaises(ValueError):
+                c.render(state)
+
+    def test_logging_limited_not_drop_limited(self):
+        state = self.state()
+        state["logging"] = True
+        lines = c.render(state).splitlines()
+        self.assertEqual(sum("log prefix" in x for x in lines), 2)
+        self.assertTrue(all("limit" not in x for x in lines if "drop" in x))
+
+    def test_all_sources_or_failure(self):
+        with patch.object(c, "download", side_effect=[["1.2.3.0/24"], ValueError("offline")]):
+            with self.assertRaises(ValueError):
+                c.fetch_lists()
+
+    def test_syntax_checked_before_apply(self):
+        with patch.object(c, "present", return_value=False), patch.object(c, "run", side_effect=ValueError("bad")) as run:
+            with self.assertRaises(ValueError):
+                c.apply(self.state())
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("-c", run.call_args.args)
+
+    def test_nft_apply_uses_extended_timeout(self):
+        with patch.object(c, "present", return_value=False), patch.object(c, "run") as run:
+            c.apply(self.state())
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(all(call.kwargs["timeout"] == 300 for call in run.call_args_list))
+
+    def test_atomic(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "state.json"
+            c.atomic(path, json.dumps(self.state()))
+            self.assertEqual(json.loads(path.read_text()), self.state())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_disk_failure_reverts_rules(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "enabled").touch()
+            with patch.object(c, "ROOT", root), patch.object(c, "apply") as apply, patch.object(c, "save", side_effect=OSError("disk")):
+                with self.assertRaises(OSError):
+                    c.commit({"new": True}, {"old": True})
+                self.assertEqual(apply.call_args_list[1].args, ({"old": True},))
+
+    def test_state_validation_rejects_missing_and_wrong_fields(self):
+        valid = dict(schema=1, ssh_ports=[22], allow=['198.51.100.9'], manual=[],
+                     lists={name: ['198.51.100.0/24'] for name in c.SOURCES},
+                     updated=1, logging=True)
+        self.assertEqual(c.validate_state(valid)['ssh_ports'], [22])
+        for change in ({'ssh_ports': []}, {'allow': []}, {'logging': 'yes'},
+                       {'lists': {'wrong': ['198.51.100.0/24']}}):
+            broken = dict(valid, **change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                c.validate_state(broken)
+
+    def test_state_validation_rejects_combined_default_route(self):
+        lists = {name: ['198.51.100.0/24'] for name in c.SOURCES}
+        names = list(c.SOURCES)
+        lists[names[0]] = ['0.0.0.0/1']
+        lists[names[1]] = ['128.0.0.0/1']
+        state = dict(schema=1, ssh_ports=[22], allow=['198.51.100.9'], manual=[],
+                     lists=lists, updated=1, logging=True)
+        with self.assertRaisesRegex(ValueError, 'совокупные блокировки'):
+            c.validate_state(state)
+
+    def test_https_redirect(self):
+        with self.assertRaises(ValueError):
+            c.HTTPSOnly().redirect_request(None, None, 302, "", {}, "http://example.com")
+
+    def test_top_only_our_logs(self):
+        lines = [json.dumps({"MESSAGE": x}) for x in
+                 ("NVTC4 IN=eth0 SRC=1.2.3.4 DST=2.3.4.5", "NVTC4 SRC=1.2.3.4 ",
+                  "OTHER SRC=5.6.7.8", "NVTC6 SRC=2001:db8::1 DST=::1", "NVTC4 SRC=999.1.1.1 ")]
+        self.assertEqual(c.journal_top("\n".join(lines)), [("1.2.3.4", 2), ("2001:db8::1", 1)])
+
+    def test_top_accepts_empty_journal(self):
+        result = c.subprocess.CompletedProcess(('journalctl',), 1, '', '')
+        output = io.StringIO()
+        with patch.object(c, 'run', return_value=result), patch('sys.stdout', output):
+            c.top(resolve=False)
+        self.assertIn('Блокировок за 24 часа пока нет', output.getvalue())
+        self.assertNotIn('Пакетов', output.getvalue())
+        self.assertNotIn('Владелец сети', output.getvalue())
+
+    def test_top_table_fits_terminal_width(self):
+        messages = [json.dumps({"MESSAGE": "NVTC6 SRC=2001:db8:1234:5678::1234 "})]
+        result = c.subprocess.CompletedProcess(('journalctl',), 0, '\n'.join(messages), '')
+        for width in (20, 32, 60, 80, 100, 120):
+            with self.subTest(width=width):
+                output = io.StringIO()
+                expected = min(width, 78)
+                with patch.object(c, 'run', return_value=result), \
+                     patch.object(c, 'lookup_many', return_value={"2001:db8:1234:5678::1234": "X" * 200}), \
+                     patch.object(c.shutil, 'get_terminal_size', return_value=c.os.terminal_size((width, 24))), \
+                     patch('sys.stdout', output):
+                    c.top(resolve=True)
+                lines = output.getvalue().splitlines()
+                self.assertTrue(all(len(line) <= expected for line in lines))
+                self.assertEqual(len(lines[1]), expected)
+                if width >= 60:
+                    self.assertIn('Организация', output.getvalue())
+
+    def test_ascii_symbols_for_non_utf8_stdout(self):
+        class AsciiOutput(io.StringIO):
+            encoding = 'ascii'
+
+        output = AsciiOutput()
+        with patch('sys.stdout', output):
+            c.ok('готово')
+            c.rule()
+        self.assertIn('[OK] готово', output.getvalue())
+        self.assertIn('-' * c.terminal_width(), output.getvalue())
+
+    def test_log_report_accepts_empty_journals(self):
+        output = io.StringIO()
+        with patch.object(c, 'journal_output', return_value=''), patch('sys.stdout', output):
+            c.print_logs()
+        self.assertIn('За последние 24 часа записей нет', output.getvalue())
+        self.assertIn('За последние 7 дней записей нет', output.getvalue())
+
+    def test_rdap_network_fallback(self):
+        self.assertEqual(c.rdap_label({"name": "EXAMPLE-NET"}), "EXAMPLE-NET")
+
+    def test_rdap_owner(self):
+        self.assertEqual(c.rdap_label({"entities": [{"roles": ["registrant"],
+            "vcardArray": ["vcard", [["org", {}, "text", "Example Hosting"]]]}]}), "Example Hosting")
+
+    def test_rdap_batch_uses_cache_and_resolves_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            cache = {"1.1.1.1": {"time": c.time.time(), "label": "Cloudflare"}}
+            (root / "rdap-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+            with patch.object(c, "ROOT", root), patch.object(c, "rdap_lookup", return_value="Google") as lookup:
+                labels = c.lookup_many(["1.1.1.1", "8.8.8.8"])
+            self.assertEqual(labels, {"1.1.1.1": "Cloudflare", "8.8.8.8": "Google"})
+            lookup.assert_called_once_with("8.8.8.8")
+
+    def test_bad_rdap_cache_entry_is_ignored(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "rdap-cache.json").write_text(
+                json.dumps({"1.1.1.1": {"time": "bad", "label": "bad"}}), encoding="utf-8")
+            with patch.object(c, "ROOT", root), patch.object(c, "rdap_lookup", return_value="Cloudflare"):
+                self.assertEqual(c.lookup_many(["1.1.1.1"]), {"1.1.1.1": "Cloudflare"})
+
+    def test_interactive_accept(self):
+        with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.dict(c.os.environ, {'SSH_CONNECTION': '1.2.3.4 50000 5.6.7.8 2222'}), patch.object(c, 'panel_hint', return_value='9.8.7.6'), patch('builtins.input', side_effect=['д', 'д', 'д', 'д']):
+            self.assertEqual(c.install_inputs(Namespace(ssh_port=None, allow=[])), ([2222], ['1.2.3.4', '9.8.7.6']))
+
+    def test_rejected_hints_not_retained(self):
+        with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.dict(c.os.environ, {'SSH_CONNECTION': '1.2.3.4 50000 5.6.7.8 2222'}), patch.object(c, 'panel_hint', return_value='9.8.7.6'), patch('builtins.input', side_effect=['н', '8.8.8.8', 'н', '22', 'н', '1.1.1.1', 'д']):
+            self.assertEqual(c.install_inputs(Namespace(ssh_port=None, allow=[])), ([22], ['1.1.1.1', '8.8.8.8']))
+
+    def test_no_terminal(self):
+        with patch.object(c.sys.stdin, 'isatty', return_value=False), self.assertRaises(ValueError):
+            c.install_inputs(Namespace(ssh_port=None, allow=[]))
+
+    def test_explicit_flags_not_augmented(self):
+        with patch.dict(c.os.environ, {'SSH_CONNECTION': '9.9.9.9 123 5.5.5.5 5555'}):
+            self.assertEqual(c.install_inputs(Namespace(ssh_port=[22], allow=['1.1.1.1'])), ([22], ['1.1.1.1']))
+
+    def test_invalid_then_valid(self):
+        with patch('builtins.input', side_effect=['65536', '22']):
+            self.assertEqual(c.ask_value('SSH', '', c.port_list), [22])
+
+    def test_domain_requires_confirmation(self):
+        result = c.subprocess.CompletedProcess(('getent',), 0, '1.2.3.4 STREAM panel.example.com\n', '')
+        with patch.object(c.shutil, 'which', return_value='/usr/bin/getent'), \
+             patch.object(c, 'run', return_value=result), patch('builtins.input', return_value='н'), \
+             self.assertRaises(ValueError):
+            c.panel_input('panel.example.com')
+
+    def test_domain_lookup_has_timeout(self):
+        result = c.subprocess.CompletedProcess(('getent',), 0, '1.2.3.4 STREAM panel.example.com\n', '')
+        with patch.object(c.shutil, 'which', return_value='/usr/bin/getent'), \
+             patch.object(c, 'run', return_value=result) as run, patch('builtins.input', return_value='д'):
+            self.assertEqual(c.panel_input('panel.example.com'), ['1.2.3.4'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 10)
+
+    def test_yes_no_accepts_russian_and_english(self):
+        for answer, expected in [('Да', True), ('YES', True), ('Нет', False), ('n', False)]:
+            with self.subTest(answer=answer), patch('builtins.input', return_value=answer):
+                self.assertEqual(c.ask_yes('Продолжить?'), expected)
+
+    def test_vision_field_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'settings.json'
+            c.atomic(path, json.dumps({'panel_ips': '1.1.1.1 8.8.8.8', 'secret': 'never-print'}))
+            with patch.object(Path, 'stat') as stat:
+                stat.return_value.st_uid = 0
+                stat.return_value.st_mode = 0o100600
+                stat.return_value.st_size = 100
+                self.assertEqual(c.panel_hint(path), '1.1.1.1 8.8.8.8')
+
+    def test_color_disabled_for_pipe(self):
+        with patch.object(c.sys.stdout, 'isatty', return_value=False):
+            self.assertEqual(c.colored('Тест', 'red', 'bold'), 'Тест')
+
+    def test_no_color_environment(self):
+        with patch.object(c.sys.stdout, 'isatty', return_value=True), patch.dict(c.os.environ, {'NO_COLOR': '1'}):
+            self.assertEqual(c.colored('Тест', 'green'), 'Тест')
+
+    def test_color_enabled_for_terminal(self):
+        with patch.object(c.sys.stdout, 'isatty', return_value=True), patch.dict(c.os.environ, {}, clear=True):
+            self.assertIn('\033[92m', c.colored('Тест', 'green'))
+
+    def test_redirected_stderr_does_not_receive_ansi(self):
+        class Terminal(io.StringIO):
+            encoding = 'utf-8'
+            def isatty(self):
+                return True
+        output, errors = Terminal(), io.StringIO()
+        with patch('sys.stdout', output), patch.dict(c.os.environ, {}, clear=True):
+            c.err('ошибка', file=errors)
+        self.assertNotIn('\033[', errors.getvalue())
+
+    def test_vertical_menu_before_install(self):
+        output = io.StringIO()
+        with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, patch('builtins.input', return_value='0'), patch('sys.stdout', output):
+            state.exists.return_value = False
+            c.menu()
+        text = output.getvalue()
+        self.assertIn('Версия ' + c.VERSION, text)
+        self.assertNotIn('ТЕСТОВАЯ ВЕРСИЯ', text)
+        self.assertIn('[ 1] Установить компонент', text)
+        self.assertNotIn('[10]  Удалить компонент', text)
+        self.assertNotIn('\033[', text)
+
+    def test_vertical_menu_after_install(self):
+        output = io.StringIO()
+        with patch.object(c.sys.stdout, 'isatty', return_value=False), patch.object(c, 'STATE') as state, \
+             patch.object(c, 'load', return_value=self.state()), \
+             patch.object(c, 'component_report', side_effect=lambda value: print('ОТЧЁТ КОМПОНЕНТОВ')), \
+             patch.object(c, 'top', side_effect=lambda **kwargs: print('ТОП-10 ПРОВЕРКА')), \
+             patch('builtins.input', return_value='0'), patch('sys.stdout', output):
+            state.exists.return_value = True
+            c.menu()
+        text = output.getvalue()
+        self.assertIn('[ 1] Показать краткое состояние', text)
+        self.assertIn('[10] Удаление программы', text)
+        self.assertIn('[11] Самодиагностика', text)
+        self.assertIn('Просмотр', text)
+        self.assertIn('Списки', text)
+        self.assertIn('Управление', text)
+        self.assertIn('Включить фильтрацию', text)
+        self.assertNotIn('Пробно', text)
+        self.assertNotIn('Подтвердить пробное', text)
+        self.assertLess(text.index('ГЛАВНОЕ МЕНЮ'), text.index('ТОП-10 ПРОВЕРКА'))
+
+    def test_short_command_aliases(self):
+        self.assertEqual(c.normalize_argv(['s']), ['status'])
+        self.assertEqual(c.normalize_argv(['on']), ['activate'])
+        self.assertEqual(c.normalize_argv(['fix', '--yes']), ['repair', '--yes'])
+        self.assertEqual(c.normalize_argv(['l']), ['logs'])
+
+    def test_install_confirmation_precedes_dependencies(self):
+        with patch.object(c.os, 'geteuid', return_value=0), \
+             patch.object(c, 'confirm_install_start', side_effect=ValueError('отмена')), \
+             patch.object(c, 'ensure_dependencies') as dependencies, self.assertRaisesRegex(ValueError, 'отмена'):
+            c.main(['install'])
+        dependencies.assert_not_called()
+
+    def test_install_conflict_precedes_confirmation_and_dependencies(self):
+        with patch.object(c.os, 'geteuid', return_value=0), \
+             patch.object(c, 'preflight_install', side_effect=ValueError('конфликт')), \
+             patch.object(c, 'confirm_install_start') as confirmation, \
+             patch.object(c, 'ensure_dependencies') as dependencies, \
+             self.assertRaisesRegex(ValueError, 'конфликт'):
+            c.main(['install'])
+        confirmation.assert_not_called()
+        dependencies.assert_not_called()
+
+    def test_repeated_install_repairs_without_changing_configuration(self):
+        state = dict(schema=1, ssh_ports=[22], allow=['198.51.100.9'], manual=[],
+                     lists={name: ['198.51.100.0/24'] for name in c.SOURCES},
+                     updated=1, logging=True)
+        with patch.object(c, 'preflight_install', return_value='existing'), \
+             patch.object(c, 'load', return_value=state), \
+             patch.object(c, 'repair', return_value=0) as repair, \
+             patch.object(c, 'activate') as activate, patch.object(c, 'ROOT') as root:
+            root.__truediv__.return_value.exists.return_value = False
+            c.install(Namespace(logging=True))
+        repair.assert_called_once_with(state, confirmed=True)
+        activate.assert_called_once_with()
+
+    def test_repeated_install_keeps_active_filtering_active(self):
+        state = self.state()
+        with patch.object(c, 'preflight_install', return_value='existing'), \
+             patch.object(c, 'load', return_value=state), \
+             patch.object(c, 'repair', return_value=0), \
+             patch.object(c, 'activate') as activate, patch.object(c, 'ROOT') as root:
+            root.__truediv__.return_value.exists.return_value = True
+            c.install(Namespace(logging=True))
+        activate.assert_not_called()
+
+    def test_fresh_install_activates_filtering(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root, systemd = base / 'state', base / 'systemd'
+            systemd.mkdir()
+            binary, short, state_file = base / 'bin', base / 'ntc', root / 'state.json'
+            lists = {name: ['198.51.100.0/24'] for name in c.SOURCES}
+            with patch.object(c, 'ROOT', root), patch.object(c, 'STATE', state_file), \
+                 patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short), \
+                 patch.object(c, 'SYSTEMD', systemd), \
+                 patch.object(c, 'preflight_install', return_value='new'), \
+                 patch.object(c, 'present', return_value=False), \
+                 patch.object(c, 'install_inputs', return_value=([22], ['198.51.100.9'])), \
+                 patch.object(c, 'fetch_lists', return_value=lists), \
+                 patch.object(c, 'run'), patch.object(c, 'activate') as activate:
+                c.install(Namespace(logging=True))
+            activate.assert_called_once_with()
+
+    def test_menu_requires_root_before_opening(self):
+        with patch.object(c.sys.stdin, 'isatty', return_value=True), patch.object(c.os, 'geteuid', return_value=1000), patch.object(c, 'menu') as menu, self.assertRaises(ValueError):
+            c.main([])
+        menu.assert_not_called()
+
+    def test_dependency_error_is_value_error_not_parser_exit(self):
+        with patch.object(c.os, 'geteuid', return_value=0), patch.object(c, 'ensure_dependencies', side_effect=ValueError('нет nft')), self.assertRaisesRegex(ValueError, 'нет nft'):
+            c.main(['status'])
+
+    def test_restore_pending_does_not_manage_systemd_units(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'pending').touch()
+            with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), patch.object(c, 'disable') as disable:
+                c.execute(Namespace(command='restore'))
+            disable.assert_called_once_with(units=False)
+
+    def test_failed_install_removes_partial_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root, systemd = base / 'state', base / 'systemd'
+            systemd.mkdir()
+            binary, short, state_file = base / 'bin', base / 'ntc', root / 'state.json'
+
+            def fake_run(*args, **kwargs):
+                if args == ('systemctl', 'daemon-reload') and kwargs.get('check', True):
+                    raise OSError('daemon-reload failed')
+
+            lists = {name: ['198.51.100.0/24'] for name in c.SOURCES}
+            with patch.object(c, 'ROOT', root), patch.object(c, 'STATE', state_file), \
+                 patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short), \
+                 patch.object(c, 'SYSTEMD', systemd), \
+                 patch.object(c, 'present', return_value=False), \
+                 patch.object(c, 'install_inputs', return_value=([22], ['198.51.100.9'])), \
+                 patch.object(c, 'fetch_lists', return_value=lists), \
+                 patch.object(c, 'run', side_effect=fake_run), self.assertRaises(OSError):
+                c.install(Namespace(logging=True))
+            self.assertFalse(binary.exists())
+            self.assertFalse(short.exists())
+            self.assertFalse(state_file.exists())
+            self.assertFalse(any((systemd / name).exists() for name in c.service_files()))
+
+    def test_shortcut_points_to_main_binary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            binary, short = base / 'control', base / 'ntc'
+            binary.touch()
+            with patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short):
+                c.write_shortcut()
+                self.assertTrue(c.shortcut_valid())
+
+    def test_compact_status_does_not_dump_rules(self):
+        output = io.StringIO()
+        with patch.object(c, 'present', return_value=True), patch.object(c, 'ROOT') as root, \
+             patch('sys.stdout', output):
+            root.__truediv__.return_value.exists.return_value = False
+            c.print_status(self.state())
+        text = output.getvalue()
+        self.assertIn('СОСТОЯНИЕ', text)
+        self.assertIn('Таблица nftables', text)
+        self.assertIn('Списки обновлены', text)
+        self.assertIn('14.11.2023', text)
+        self.assertIn('Полные правила: nuvrion-traffic-control rules', text)
+        self.assertNotIn('table inet', text)
+
+    def test_help_is_russian_and_documents_all_commands(self):
+        output = io.StringIO()
+        with patch('sys.stdout', output), self.assertRaises(SystemExit):
+            c.main(['--help'])
+        text = output.getvalue()
+        self.assertIn('использование:', text)
+        self.assertIn('параметры:', text)
+        for command in ('install', 'top', 'status', 'rules', 'logs', 'check', 'activate',
+                        'disable', 'restore', 'rollback', 'update', 'repair',
+                        'ban', 'unban', 'allow', 'disallow', 'uninstall'):
+            self.assertIn(command, text)
+        self.assertNotIn('confirm', text)
+
+    def test_activation_commits_without_user_confirmation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                 patch.object(c, 'apply') as apply, patch.object(c, 'present', return_value=True), \
+                 patch.object(c, 'run') as run, patch('builtins.input') as user_input:
+                c.activate()
+                self.assertTrue((root / 'enabled').exists())
+                self.assertFalse((root / 'pending').exists())
+                apply.assert_called_once()
+                user_input.assert_not_called()
+                calls = [call.args for call in run.call_args_list]
+                self.assertIn(('systemctl', 'enable', c.UNIT + '.service'), calls)
+                self.assertIn(('systemctl', 'enable', '--now', c.UNIT + '-update.timer'), calls)
+                self.assertNotIn(('systemctl', 'enable', '--now', c.UNIT + '.service'), calls)
+                self.assertEqual(calls[-1], ('systemctl', 'stop', c.UNIT + '-rollback.timer'))
+
+    def test_activation_failures_clean_up_and_allow_retry(self):
+        for failure in ('apply', 'service', 'timer', 'marker'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                real_atomic = c.atomic
+
+                def fake_run(*args, **kwargs):
+                    if failure == 'service' and args == ('systemctl', 'enable', c.UNIT + '.service'):
+                        raise OSError('activation failed')
+                    if failure == 'timer' and args == ('systemctl', 'enable', '--now', c.UNIT + '-update.timer'):
+                        raise OSError('activation failed')
+
+                def fake_atomic(path, text, mode=0o600):
+                    if failure == 'marker' and path.name == 'enabled':
+                        raise OSError('activation failed')
+                    return real_atomic(path, text, mode)
+
+                with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                     patch.object(c, 'apply', side_effect=OSError('activation failed') if failure == 'apply' else None), \
+                     patch.object(c, 'present', return_value=True), patch.object(c, 'remove_table') as remove, \
+                     patch.object(c, 'run', side_effect=fake_run), patch.object(c, 'atomic', side_effect=fake_atomic):
+                    with self.assertRaisesRegex(OSError, 'activation failed'):
+                        c.activate()
+                    self.assertFalse((root / 'pending').exists())
+                    self.assertFalse((root / 'enabled').exists())
+                    remove.assert_called_once()
+                with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                     patch.object(c, 'apply'), patch.object(c, 'present', return_value=True), patch.object(c, 'run'):
+                    c.activate()
+                    self.assertTrue((root / 'enabled').exists())
+
+    def test_queued_rollback_after_success_does_not_disable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'enabled').touch()
+            with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                 patch.object(c, 'disable') as disable:
+                c.execute(Namespace(command='rollback'))
+                disable.assert_not_called()
+
+    def test_repeated_activation_leaves_existing_filter_alone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'enabled').touch()
+            with patch.object(c, 'ROOT', root), patch.object(c, 'load', return_value=self.state()), \
+                 patch.object(c, 'apply') as apply, patch.object(c, 'run') as run:
+                with self.assertRaises(ValueError):
+                    c.activate()
+                apply.assert_not_called()
+                run.assert_not_called()
+
+    def test_systemd_descriptions_are_russian(self):
+        self.assertTrue(all('Description=Nuvrion' in body for body in c.service_files().values()))
+
+    def test_update_service_timeout_covers_internal_timeouts(self):
+        self.assertIn('TimeoutStartSec=15min', c.service_files()[c.UNIT + '-update.service'])
+
+    def test_disable_keeps_marker_when_table_removal_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'enabled').touch()
+            with patch.object(c, 'ROOT', root), patch.object(c, 'remove_table', side_effect=OSError('nft')):
+                with self.assertRaises(OSError):
+                    c.disable()
+            self.assertTrue((root / 'enabled').exists())
+
+    def test_successful_diagnostics_prints_final_result(self):
+        output = io.StringIO()
+        with patch.object(c, 'diagnostic_items', return_value=[('Проверка', True, 'исправно')]), \
+             patch('sys.stdout', output):
+            self.assertEqual(c.print_diagnostics(self.state()), 0)
+        self.assertIn('Все проверяемые компоненты работают штатно', output.getvalue())
+
+    def test_repair_refreshes_lists_and_creates_shortcut(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root, systemd = base / 'state', base / 'systemd'
+            root.mkdir()
+            systemd.mkdir()
+            state_file, binary, short = root / 'state.json', base / 'control', base / 'ntc'
+            state_file.write_text('{}', encoding='utf-8')
+            (root / 'enabled').touch()
+            state = dict(self.state(), lists={'test': ['198.51.100.0/24']}, updated=1, logging=True)
+            refreshed = {name: ['198.51.100.0/24'] for name in c.SOURCES}
+            with patch.object(c, 'ROOT', root), patch.object(c, 'STATE', state_file), \
+                 patch.object(c, 'BIN', binary), patch.object(c, 'SHORT_BIN', short), \
+                 patch.object(c, 'SYSTEMD', systemd), patch.object(c, 'fetch_lists', return_value=refreshed) as fetch, \
+                 patch.object(c, 'commit') as commit, patch.object(c, 'apply') as apply, \
+                 patch.object(c, 'run') as run, patch.object(c, 'print_diagnostics', return_value=0):
+                self.assertEqual(c.repair(state, confirmed=True), 0)
+                self.assertTrue(c.shortcut_valid())
+            fetch.assert_called_once_with()
+            commit.assert_called_once()
+            apply.assert_called_once()
+            self.assertIn(('systemctl', 'enable', c.UNIT + '.service'), [call.args for call in run.call_args_list])
+            self.assertNotIn(('systemctl', 'enable', '--now', c.UNIT + '.service'), [call.args for call in run.call_args_list])
+
+    def test_os_release(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'os-release'
+            path.write_text('ID="ubuntu"\nID_LIKE=debian\n# COMMENT=x\n')
+            self.assertEqual(c.os_release(path), {'ID': 'ubuntu', 'ID_LIKE': 'debian'})
+
+    def test_missing_packages(self):
+        with patch.object(c.shutil, 'which', return_value=None), patch.object(c, 'CA_CERT') as ca_cert:
+            ca_cert.is_file.return_value = False
+            self.assertEqual(c.missing_packages(), ['nftables', 'ca-certificates'])
+
+    def test_dependencies_do_not_call_apt_when_present(self):
+        with patch.object(c, 'missing_packages', return_value=[]), patch.object(c.shutil, 'which', return_value='/bin/tool'), patch.object(c.Path, 'is_dir', return_value=True), patch.object(c, 'apt_install') as apt:
+            c.ensure_dependencies(auto_install=True)
+            apt.assert_not_called()
+
+    def test_dependencies_install_only_missing(self):
+        with patch.object(c, 'missing_packages', side_effect=[['nftables'], []]), patch.object(c, 'apt_install') as apt, patch.object(c.shutil, 'which', return_value='/bin/tool'), patch.object(c.Path, 'is_dir', return_value=True):
+            c.ensure_dependencies(auto_install=True)
+            apt.assert_called_once_with(['nftables'])
+
+    def test_dependencies_without_auto_install(self):
+        with patch.object(c, 'missing_packages', return_value=['nftables']), self.assertRaises(ValueError):
+            c.ensure_dependencies(auto_install=False)
+
+    def test_supported_platform_matrix(self):
+        for values, machine, expected in [
+                ({'ID': 'ubuntu', 'VERSION_ID': '22.04'}, 'x86_64', ('ubuntu', '22.04', 'amd64')),
+                ({'ID': 'ubuntu', 'VERSION_ID': '24.04'}, 'aarch64', ('ubuntu', '24.04', 'arm64')),
+                ({'ID': 'debian', 'VERSION_ID': '12'}, 'x86_64', ('debian', '12', 'amd64'))]:
+            with self.subTest(values=values, machine=machine), patch.object(c, 'os_release', return_value=values), \
+                 patch.object(c.os, 'uname', return_value=SimpleNamespace(machine=machine)):
+                self.assertEqual(c.platform_details(), expected)
+
+    def test_unsupported_platform_is_rejected(self):
+        with patch.object(c, 'os_release', return_value={'ID': 'ubuntu', 'VERSION_ID': '20.04'}), \
+             patch.object(c.os, 'uname', return_value=SimpleNamespace(machine='x86_64')), \
+             self.assertRaisesRegex(ValueError, 'Неподдерживаемая система'):
+            c.platform_details()
+
+    def test_apt_rejects_unsupported_os(self):
+        with patch.object(c, 'os_release', return_value={'ID': 'fedora'}), patch.object(c.shutil, 'which', return_value='/usr/bin/apt-get'), patch.object(c.subprocess, 'run') as run, self.assertRaises(ValueError):
+            c.apt_install(['nftables'])
+        run.assert_not_called()
+
+    def test_apt_commands(self):
+        with patch.object(c, 'os_release', return_value={'ID': 'debian'}), patch.object(c.shutil, 'which', return_value='/usr/bin/apt-get'), patch.object(c.subprocess, 'run') as run:
+            c.apt_install(['nftables', 'ca-certificates'])
+        self.assertEqual(run.call_args_list[0].args[0], ['apt-get', 'update'])
+        self.assertEqual(run.call_args_list[1].args[0][-2:], ['nftables', 'ca-certificates'])
+
+
+if __name__ == "__main__":
+    unittest.main()
