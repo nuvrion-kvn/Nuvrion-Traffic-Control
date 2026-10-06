@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/nuvrion-banner.svg" alt="Nuvrion — авторские инструменты для Linux-серверов" width="100%"></p>
+<p align="center"><img src="assets/nuvrion-banner.png" alt="Nuvrion Traffic Control" width="100%"></p>
 <h1 align="center">Nuvrion · Traffic Control</h1>
 <p align="center">Контроль входящего трафика Linux-сервера через nftables</p>
 <p align="center">
