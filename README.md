@@ -2,7 +2,6 @@
 <h1 align="center">Nuvrion · Traffic Control</h1>
 <p align="center">Контроль входящего трафика Linux-сервера через nftables</p>
 <p align="center">
-  <a href="https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/версия-1.0.0-00bcd4" alt="Версия 1.0.0"></a>
   <a href="https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/actions/workflows/test.yml"><img src="https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/actions/workflows/test.yml/badge.svg" alt="Автоматические проверки"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/лицензия-MIT-00bcd4" alt="Лицензия MIT"></a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab" alt="Python 3.10 и новее">
@@ -10,7 +9,7 @@
 <p align="center">Автор и разработчик: <b>Nuvrion</b><br>
 <a href="https://github.com/nuvrion-kvn">GitHub · nuvrion-kvn</a></p>
 
-**Nuvrion Traffic Control 1.0.0** управляет входящими соединениями Linux-сервера через собственную таблицу nftables. Загружает три списка IP/CIDR, проверяет их содержимое и объединяет с ручными блокировками. Исключения для администратора и панели имеют приоритет.
+**Nuvrion Traffic Control** управляет входящими соединениями Linux-сервера через собственную таблицу nftables. Загружает три списка IP/CIDR, проверяет их содержимое и объединяет с ручными блокировками. Исключения для администратора и панели имеют приоритет.
 
 Поддерживает IPv4 и IPv6, восстановление правил после перезагрузки, обновления по таймеру, журнал и статистику срабатываний. Установка начинается после подтверждения; управление доступно через русское меню или команду `ntc`. Эффективность фильтрации зависит от содержимого внешних списков.
 
@@ -38,7 +37,7 @@
 Рабочая короткая команда с автоматическим определением IP текущего SSH-подключения:
 
 ```bash
-curl -fsSL https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/releases/download/v1.0.0/nuvrion-traffic-control.py -o ntc.py && sudo env SSH_CONNECTION="${SSH_CONNECTION:-}" python3 ntc.py install
+curl -fsSL https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/releases/latest/download/nuvrion-traffic-control.py -o ntc.py && sudo env SSH_CONNECTION="${SSH_CONNECTION:-}" python3 ntc.py install
 ```
 
 Скрипт будет сохранён в текущем каталоге как `ntc.py`, после чего запустится интерактивная установка.
@@ -50,13 +49,13 @@ curl -fsSL https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/releases/downl
 Недостающие `nftables` и `ca-certificates` устанавливаются через apt после согласия на установку.
 Python должен быть установлен заранее. Проверки проекта запускаются в GitHub Actions; полная матрица серверных ОС требует отдельной проверки.
 
-Скачайте скрипт и контрольную сумму из фиксированного релиза **v1.0.0**:
+Скачайте скрипт и контрольную сумму из последнего опубликованного выпуска:
 
 ```bash
 curl -fsSLo nuvrion-traffic-control.py \
-  https://raw.githubusercontent.com/nuvrion-kvn/Nuvrion-Traffic-Control/v1.0.0/nuvrion-traffic-control.py &&
+  https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/releases/latest/download/nuvrion-traffic-control.py &&
 curl -fsSLo SHA256SUMS \
-  https://raw.githubusercontent.com/nuvrion-kvn/Nuvrion-Traffic-Control/v1.0.0/SHA256SUMS &&
+  https://github.com/nuvrion-kvn/Nuvrion-Traffic-Control/releases/latest/download/SHA256SUMS &&
 sha256sum -c SHA256SUMS &&
 sudo env SSH_CONNECTION="${SSH_CONNECTION:-}" python3 ./nuvrion-traffic-control.py install
 ```
@@ -200,7 +199,7 @@ sudo ntc uninstall --yes
 
 ## Документация проекта
 
-- [Описание версии 1.0.0](RELEASE_NOTES.md)
+- [Описание возможностей](RELEASE_NOTES.md)
 - [Обновление установленной версии](docs/UPDATE.md)
 - [Поддержка и сообщения об ошибках](SUPPORT.md)
 - [Сообщения об уязвимостях](SECURITY.md)
