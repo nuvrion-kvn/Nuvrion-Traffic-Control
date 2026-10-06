@@ -1,4 +1,5 @@
 import importlib.util
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import tempfile
@@ -14,6 +15,36 @@ spec.loader.exec_module(c)
 
 
 class ControlTests(unittest.TestCase):
+    def test_recovery_does_not_parse_missing_or_corrupt_state(self):
+        for failure in (FileNotFoundError('state.json'), ValueError('corrupt JSON')):
+            for command, pending in [('disable', False), ('rollback', True), ('restore', True)]:
+                with self.subTest(command=command, failure=failure), tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder)
+                    if pending:
+                        (root/'pending').touch()
+                    with patch.object(c, 'ROOT', root), patch.object(c, 'load', side_effect=failure) as load, \
+                         patch.object(c, 'disable') as disable:
+                        c.execute(Namespace(command=command))
+                    load.assert_not_called()
+                    disable.assert_called_once_with(**({'units':False} if command == 'restore' else {}))
+
+    def test_recovery_main_does_not_require_download_dependencies(self):
+        for command in ('disable', 'rollback', 'restore'):
+            with self.subTest(command=command), patch.object(c.os, 'geteuid', return_value=0), \
+                 patch.object(c, 'exclusive_lock', return_value=nullcontext()), \
+                 patch.object(c, 'ensure_dependencies', side_effect=ValueError('missing CA')) as deps, \
+                 patch.object(c, 'execute') as execute:
+                c.main([command])
+            deps.assert_not_called()
+            self.assertEqual(execute.call_args.args[0].command, command)
+
+    def test_state_rejects_nonfinite_timestamp(self):
+        state = dict(schema=1, ssh_ports=[22], allow=['198.51.100.9'], manual=[],
+                     lists={name:['198.51.100.0/24'] for name in c.SOURCES}, logging=True)
+        for value in (float('nan'), float('inf'), float('-inf'), True, -1):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'updated'):
+                c.validate_state(dict(state, updated=value))
+
     def test_visible_padding_ignores_ansi(self):
         value = '\033[92mТест\033[0m'
         self.assertEqual(c.vislen(value), 4)

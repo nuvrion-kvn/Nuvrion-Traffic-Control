@@ -14,6 +14,7 @@ from datetime import datetime
 import fcntl
 import ipaddress
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -664,7 +665,8 @@ def validate_state(state):
         [item for values in normalized_lists.values() for item in values] + manual,
         "совокупные блокировки")
     updated = state.get("updated")
-    if not isinstance(updated, (int, float)) or isinstance(updated, bool) or updated < 0:
+    if (not isinstance(updated, (int, float)) or isinstance(updated, bool) or updated < 0
+            or isinstance(updated, float) and not math.isfinite(updated)):
         raise ValueError("Некорректное поле конфигурации «updated».")
     logging = state.get("logging")
     if not isinstance(logging, bool):
@@ -1320,6 +1322,18 @@ def execute(args):
     if cmd == "install":
         install(args)
         return
+    # Recovery must still work when state.json is missing or damaged.
+    # These operations remove only our table and markers; they do not render rules.
+    if cmd == "disable":
+        disable()
+        return
+    if cmd == "rollback":
+        if (ROOT / "pending").exists():
+            disable()
+        return
+    if cmd == "restore" and (ROOT / "pending").exists():
+        disable(units=False)
+        return
     state = load()
     if cmd == "top":
         top(not args.no_resolve)
@@ -1342,16 +1356,9 @@ def execute(args):
         return repair(state, args.yes)
     elif cmd == "activate":
         activate()
-    elif cmd == "rollback":
-        if (ROOT / "pending").exists():
-            disable()
     elif cmd == "restore":
-        if (ROOT / "pending").exists():
-            disable(units=False)
-        elif (ROOT / "enabled").exists():
+        if (ROOT / "enabled").exists():
             apply(state)
-    elif cmd == "disable":
-        disable()
     elif cmd == "uninstall":
         if not args.yes:
             raise ValueError("Удаление требует --yes. Списки сохранятся в " + str(ROOT))
@@ -1596,7 +1603,7 @@ def main(argv=None):
             raise ValueError("Восстановление отменено пользователем.")
         args.yes = True
     try:
-        if args.command != "check":
+        if args.command not in ("check", "disable", "rollback", "restore"):
             ensure_dependencies(auto_install=args.command in ("install", "repair"))
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise ValueError(str(exc)) from exc
